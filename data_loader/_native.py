@@ -143,6 +143,7 @@ class CDataLoaderAPI:
             ctypes.c_bool,
             CDataloaderSkipConfig,
             CDataloaderDDPConfig,
+            ctypes.c_longlong,  # shuffle_buffer_bytes (0 = disabled)
         ]
 
         # EXPORT void CDECL destroy_fen_batch_stream(FenBatchStream* stream)
@@ -172,6 +173,7 @@ class CDataLoaderAPI:
             ctypes.c_bool,
             CDataloaderSkipConfig,
             CDataloaderDDPConfig,
+            ctypes.c_longlong,  # shuffle_buffer_bytes (0 = disabled)
         ]
 
         # EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)

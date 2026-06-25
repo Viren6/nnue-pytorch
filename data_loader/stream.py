@@ -38,6 +38,7 @@ def create_fen_batch_stream(
     cyclic,
     config: DataloaderSkipConfig,
     ddp_config: DataloaderDDPConfig = None,
+    shuffle_buffer_bytes: int = 0,
 ) -> ctypes.c_void_p:
     if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
@@ -51,6 +52,7 @@ def create_fen_batch_stream(
         cyclic,
         CDataloaderSkipConfig(config),
         CDataloaderDDPConfig(ddp_config),
+        int(shuffle_buffer_bytes),
     )
 
 
@@ -74,6 +76,7 @@ def create_sparse_batch_stream(
     cyclic,
     config: DataloaderSkipConfig,
     ddp_config: DataloaderDDPConfig = None,
+    shuffle_buffer_bytes: int = 0,
 ) -> ctypes.c_void_p:
     if ddp_config is None:
         rank, world_size = _get_ddp_rank_and_world_size()
@@ -88,6 +91,7 @@ def create_sparse_batch_stream(
         cyclic,
         CDataloaderSkipConfig(config),
         CDataloaderDDPConfig(ddp_config),
+        int(shuffle_buffer_bytes),
     )
 
 

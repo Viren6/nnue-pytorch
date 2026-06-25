@@ -38,12 +38,15 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -341,15 +344,25 @@ namespace monty {
         static constexpr int         READ_GAMES_PER_LOCK = 16;   // amortize read lock
         using Chunk = std::vector<TrainingDataEntry>;
 
+        // shuffle_buffer_bytes>0 enables a bullet/Monty-style block shuffle (see
+        // the shuffler/slicer below). It is the TOTAL host RAM for the shuffle;
+        // it is split across the two ping-pong blocks (so each block holds
+        // shuffle_buffer_bytes/2 worth of entries), mirroring bullet/Monty's
+        // `buffer_size_mb*MB/sizeof/2`. 0 keeps the original game-order behaviour
+        // (used by tools / the verifier, which need deterministic order).
         MontyFenInputStream(std::string filename, bool cyclic,
                             std::function<bool(const TrainingDataEntry&)> skipPredicate,
-                            int rank = 0, int world_size = 1, int concurrency = 1) :
+                            int rank = 0, int world_size = 1, int concurrency = 1,
+                            std::size_t shuffle_buffer_bytes = 0) :
             m_filename(std::move(filename)),
             m_stream(m_filename, openmode),
             m_skipPredicate(std::move(skipPredicate)),
             m_cyclic(cyclic),
             m_rank(rank),
-            m_world_size(world_size < 1 ? 1 : world_size)
+            m_world_size(world_size < 1 ? 1 : world_size),
+            m_shuffle_enabled(shuffle_buffer_bytes > 0),
+            m_rng(0x9E3779B97F4A7C15ull ^
+                  (static_cast<std::uint64_t>(rank) * 0xD1B54A32D192ED03ull))
         {
             m_queue.reserve_internal(CHUNK_SIZE);
             const int nprod = concurrency < 1 ? 1 : concurrency;
@@ -357,8 +370,28 @@ namespace monty {
             {
                 m_active_producers.store(0);
                 m_eof.store(true);
+                m_output_done.store(true);
                 return;
             }
+
+            if (m_shuffle_enabled)
+            {
+                m_decoded_queue.reserve_internal(CHUNK_SIZE);
+                m_block_cap = shuffle_buffer_bytes / 2 / sizeof(TrainingDataEntry);
+                if (m_block_cap < CHUNK_SIZE) m_block_cap = CHUNK_SIZE;
+                m_block[0].reserve(m_block_cap);
+                m_block[1].reserve(m_block_cap);
+                m_free_idx.push_back(0);
+                m_free_idx.push_back(1);
+                m_producer_queue = &m_decoded_queue; // producers -> shuffler
+                m_slicer   = std::thread([this]() { slicer_loop(); });
+                m_shuffler = std::thread([this]() { shuffler_loop(); });
+            }
+            else
+            {
+                m_producer_queue = &m_queue;         // producers -> consumers
+            }
+
             m_active_producers.store(nprod);
             m_producers.reserve(nprod);
             for (int i = 0; i < nprod; ++i)
@@ -411,18 +444,34 @@ namespace monty {
         ~MontyFenInputStream() override
         {
             m_stop.store(true);
-            m_queue.signal_stop(true); // wake producers (put) and consumers (take)
+            // Wake everyone blocked on any queue (put or take) or handoff cv.
+            m_decoded_queue.signal_stop(true);
+            m_queue.signal_stop(true);
+            { std::lock_guard<std::mutex> lk(m_hand_mtx); }
+            m_free_cv.notify_all();
+            m_ready_cv.notify_all();
             for (auto& t : m_producers)
                 if (t.joinable())
                     t.join();
+            if (m_shuffler.joinable()) m_shuffler.join();
+            if (m_slicer.joinable())   m_slicer.join();
         }
 
     private:
-        // consumers should stop waiting once shutting down or all producers exited
+        // Consumers drain m_queue. Without shuffle it is fed by the producers, so
+        // it is done once they all exit. With shuffle it is fed by the slicer, so
+        // it is done once the slicer signals output_done.
         bool queue_done() const
         {
-            return m_stop.load() || m_active_producers.load() == 0;
+            if (m_stop.load()) return true;
+            if (m_shuffle_enabled) return m_output_done.load();
+            return m_active_producers.load() == 0;
         }
+
+        // The shuffler drains m_decoded_queue; it is done once all producers exit.
+        bool shuffler_input_done() const { return m_stop.load() || m_producers_done.load(); }
+        // The slicer drains m_ready_idx; it is done once the shuffler exits.
+        bool slicer_input_done()   const { return m_stop.load() || m_shuffler_done.load(); }
 
         void reopen_locked()
         {
@@ -611,7 +660,7 @@ namespace monty {
                     decode_blob(b, chunk);
                     if (chunk.size() >= CHUNK_SIZE)
                     {
-                        if (!m_queue.put(chunk, [this]() { return m_stop.load(); })) { running = false; break; }
+                        if (!m_producer_queue->put(chunk, [this]() { return m_stop.load(); })) { running = false; break; }
                         chunk.clear();
                     }
                 }
@@ -619,9 +668,125 @@ namespace monty {
             }
 
             if (!chunk.empty() && !m_stop.load())
-                m_queue.put(chunk, [this]() { return m_stop.load(); });
+                m_producer_queue->put(chunk, [this]() { return m_stop.load(); });
             if (m_active_producers.fetch_sub(1) == 1)
-                m_queue.signal_stop(false); // last producer: wake consumers so they can finish
+            {
+                // Last producer: no more decoded data will be produced. Wake the
+                // shuffler (shuffle path) or the consumers (no-shuffle path).
+                m_producers_done.store(true);
+                m_producer_queue->signal_stop(false);
+            }
+        }
+
+        // ---- shuffle pipeline (only used when m_shuffle_enabled) ---------------
+        //
+        // Producers feed decoded entries into m_decoded_queue (game order). The
+        // single shuffler thread draws them and builds a large block using the
+        // inside-out Fisher-Yates so the block is uniformly shuffled as it fills
+        // (no separate shuffle pass -> never stalls the decoders). Full blocks are
+        // handed, via a 2-slot ping-pong (m_free_idx / m_ready_idx), to the slicer
+        // thread, which chops them into chunks for the consumers. Two blocks are
+        // live at once (one filling, one draining) -> total RAM is the configured
+        // shuffle_buffer_bytes, matching bullet/Monty.
+
+        // Block-index handoff. Returns false only when shutting down.
+        bool take_free(int& out)
+        {
+            std::unique_lock<std::mutex> lk(m_hand_mtx);
+            m_free_cv.wait(lk, [this]() { return !m_free_idx.empty() || m_stop.load(); });
+            if (m_free_idx.empty()) return false;
+            out = m_free_idx.front();
+            m_free_idx.pop_front();
+            return true;
+        }
+        void put_free(int idx)
+        {
+            { std::lock_guard<std::mutex> lk(m_hand_mtx); m_free_idx.push_back(idx); }
+            m_free_cv.notify_one();
+        }
+        void put_ready(int idx)
+        {
+            { std::lock_guard<std::mutex> lk(m_hand_mtx); m_ready_idx.push_back(idx); }
+            m_ready_cv.notify_one();
+        }
+        // Returns false when no more full blocks will arrive (shuffler done / stop).
+        bool take_ready(int& out)
+        {
+            std::unique_lock<std::mutex> lk(m_hand_mtx);
+            m_ready_cv.wait(lk, [this]() { return !m_ready_idx.empty() || slicer_input_done(); });
+            if (m_ready_idx.empty()) return false;
+            out = m_ready_idx.front();
+            m_ready_idx.pop_front();
+            return true;
+        }
+
+        void shuffler_loop()
+        {
+            int cur = -1;
+            if (!take_free(cur)) { finish_shuffler(); return; }
+            m_block[cur].clear();
+
+            Chunk in;
+            in.reserve(CHUNK_SIZE);
+            bool more = true;
+            while (more && !m_stop.load())
+            {
+                in.clear();
+                if (!m_decoded_queue.take(in, [this]() { return shuffler_input_done(); })) { more = false; break; }
+                for (auto& e : in)
+                {
+                    std::vector<TrainingDataEntry>& buf = m_block[cur];
+                    const std::size_t i = buf.size();
+                    const std::size_t j = static_cast<std::size_t>(m_rng() % (i + 1));
+                    if (j == i) buf.push_back(std::move(e));            // inside-out:
+                    else { buf.push_back(std::move(buf[j]));            //   move slot j to end,
+                           buf[j] = std::move(e); }                     //   put new entry at j
+                    if (buf.size() >= m_block_cap)
+                    {
+                        put_ready(cur);
+                        cur = -1;
+                        if (!take_free(cur)) { more = false; break; }
+                        m_block[cur].clear();
+                    }
+                }
+            }
+            // Non-cyclic EOF: emit the trailing partial block (still uniformly
+            // shuffled thanks to the inside-out invariant). Cyclic training never
+            // reaches here.
+            if (!m_stop.load() && cur >= 0 && !m_block[cur].empty())
+                put_ready(cur);
+            finish_shuffler();
+        }
+
+        void finish_shuffler()
+        {
+            m_shuffler_done.store(true);
+            m_ready_cv.notify_all(); // no more ready blocks; wake slicer
+        }
+
+        void slicer_loop()
+        {
+            Chunk c;
+            c.reserve(CHUNK_SIZE);
+            int idx = -1;
+            bool running = true;
+            while (running && !m_stop.load())
+            {
+                if (!take_ready(idx)) break;
+                std::vector<TrainingDataEntry>& buf = m_block[idx];
+                for (std::size_t off = 0; off < buf.size() && !m_stop.load(); off += CHUNK_SIZE)
+                {
+                    const std::size_t end = std::min(off + CHUNK_SIZE, buf.size());
+                    c.clear();
+                    for (std::size_t k = off; k < end; ++k) c.push_back(std::move(buf[k]));
+                    if (!m_queue.put(c, [this]() { return m_stop.load(); })) { running = false; break; }
+                }
+                buf.clear();
+                if (running)
+                    put_free(idx);
+            }
+            m_output_done.store(true);
+            m_queue.signal_stop(false); // no more output; wake consumers
         }
 
         std::string   m_filename;
@@ -634,11 +799,33 @@ namespace monty {
         std::mutex m_read_mutex;
         long long  m_game_counter = 0; // guarded by m_read_mutex
 
-        thread_safe_types::ThreadSafeRingBuffer<Chunk, QUEUE_CAPACITY> m_queue;
+        thread_safe_types::ThreadSafeRingBuffer<Chunk, QUEUE_CAPACITY> m_queue; // -> consumers
         std::vector<std::thread> m_producers;
         std::atomic<int>  m_active_producers{0};
+        std::atomic<bool> m_producers_done{false};
         std::atomic<bool> m_stop{false};
         std::atomic<bool> m_eof{false};
+
+        // Where producers push decoded chunks: &m_queue (no shuffle) or
+        // &m_decoded_queue (shuffle). Set once in the constructor.
+        thread_safe_types::ThreadSafeRingBuffer<Chunk, QUEUE_CAPACITY>* m_producer_queue = nullptr;
+
+        // ---- shuffle pipeline state (only used when m_shuffle_enabled) --------
+        bool        m_shuffle_enabled = false;
+        std::size_t m_block_cap = 0;                    // entries per ping-pong block
+        thread_safe_types::ThreadSafeRingBuffer<Chunk, QUEUE_CAPACITY> m_decoded_queue; // producers -> shuffler
+        std::vector<TrainingDataEntry> m_block[2];      // the two ping-pong blocks
+        // Block-index handoff between shuffler and slicer (only ever holds 0/1).
+        std::mutex              m_hand_mtx;
+        std::condition_variable m_free_cv;   // shuffler waits here for a free block
+        std::condition_variable m_ready_cv;  // slicer waits here for a full block
+        std::deque<int>         m_free_idx;  // blocks the shuffler may fill
+        std::deque<int>         m_ready_idx; // full blocks for the slicer
+        std::thread m_shuffler;
+        std::thread m_slicer;
+        std::atomic<bool> m_shuffler_done{false};
+        std::atomic<bool> m_output_done{false};
+        std::mt19937_64   m_rng;                        // used only by the shuffler thread
 
         std::mutex  m_next_mutex; // serializes next() (non-parallel path)
         Chunk       m_next_buf;

@@ -83,6 +83,13 @@ class TrainingConfig:
     epoch_size: int = 100_000_000
     """Number of positions per epoch."""
 
+    shuffle_buffer_gib: float = 64.0
+    """Total host RAM (GiB) for the montyformat in-loader block shuffle, used in
+    place of random-fen-skipping to decorrelate positions without dropping any.
+    Split across two ping-pong blocks (bullet/Monty-style). Only the training
+    stream uses it; validation does not. 0 disables it. No effect on Stockfish
+    binpacks (which are already shuffled at generation)."""
+
     dataloader_config: OmitArgPrefixes[DataloaderSkipConfig] = field(
         default_factory=DataloaderSkipConfig
     )

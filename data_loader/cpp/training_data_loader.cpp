@@ -479,13 +479,15 @@ FeaturedBatchStream::FeaturedBatchStream(
   bool                                          cyclic,
   std::function<bool(const TrainingDataEntry&)> skipPredicate,
   int                                           rank,
-  int                                           world_size) :
+  int                                           world_size,
+  std::size_t                                   shuffle_buffer_bytes) :
     BaseType(calculate_num_reader_threads(concurrency),
              filenames,
              cyclic,
              skipPredicate,
              rank,
-             world_size),
+             world_size,
+             shuffle_buffer_bytes),
     m_feature_set(std::move(feature_set)),
     m_batch_size(batch_size),
     m_concurrency(concurrency),
@@ -602,13 +604,15 @@ FenBatchStream::FenBatchStream(int                                           con
                                bool                                          cyclic,
                                std::function<bool(const TrainingDataEntry&)> skipPredicate,
                                int                                           rank,
-                               int                                           world_size) :
+                               int                                           world_size,
+                               std::size_t                                   shuffle_buffer_bytes) :
     BaseType(calculate_num_reader_threads(concurrency),
              filenames,
              cyclic,
              skipPredicate,
              rank,
-             world_size),
+             world_size,
+             shuffle_buffer_bytes),
     m_batch_size(batch_size),
     m_concurrency(concurrency),
     m_num_workers(calculate_num_worker_threads(concurrency)) {

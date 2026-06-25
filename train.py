@@ -216,15 +216,21 @@ def make_data_loaders(
     pin_memory,
     queue_size_limit,
     prefetch_device=None,
+    shuffle_buffer_bytes=0,
 ):
     # Epoch and validation sizes are arbitrary
     features_name = feature_name
+    # Only the (cyclic) training stream uses the in-loader shuffle buffer. The
+    # validation stream computes an order-independent average loss, so it does NOT
+    # need a shuffle buffer -- giving it one would just allocate a second copy of
+    # shuffle_buffer_bytes of host RAM for no benefit.
     train_infinite = data_loader.SparseBatchDataset(
         features_name,
         train_filenames,
         batch_size,
         num_workers=num_workers,
         config=config,
+        shuffle_buffer_bytes=shuffle_buffer_bytes,
     )
     # num_workers has to be 0 for sparse, and 1 for dense
     # it currently cannot work in parallel mode but it shouldn't need to
@@ -242,25 +248,16 @@ def make_data_loaders(
     )
     if val_size <= 0:
         val = None
-    elif val_filenames is None:
-        val = DataLoader(
-            data_loader.FixedNumBatchesDataset(
-                train_infinite,
-                (val_size + batch_size - 1) // batch_size,
-                pin_memory=pin_memory,
-                queue_size_limit=queue_size_limit,
-                device=prefetch_device,
-            ),
-            batch_size=None,
-            batch_sampler=None,
-            num_workers=0,
-        )
     else:
+        # Validation reads either its own files or (when unset) the training data,
+        # but always with shuffle_buffer_bytes=0 -- no second large host buffer.
         val_infinite = data_loader.SparseBatchDataset(
             features_name,
-            val_filenames,
+            train_filenames if val_filenames is None else val_filenames,
             batch_size,
+            num_workers=num_workers,
             config=config,
+            shuffle_buffer_bytes=0,
         )
         val = DataLoader(
             data_loader.FixedNumBatchesDataset(
@@ -447,6 +444,7 @@ def main():
         pin_memory=args.pin_memory and accelerator == "cuda",
         queue_size_limit=args.data_loader_queue_size,
         prefetch_device=torch.device("cuda") if accelerator == "cuda" else None,
+        shuffle_buffer_bytes=int(args.shuffle_buffer_gib * (1024 ** 3)),
     )
 
     refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)

@@ -119,6 +119,7 @@ class TrainingDataProvider:
         ddp_config: DataloaderDDPConfig = None,
         use_pinned_memory=False,
         device="cpu",
+        shuffle_buffer_bytes: int = 0,
     ):
         self.feature_set = feature_set.encode("utf-8")
         self.create_stream = create_stream
@@ -132,6 +133,7 @@ class TrainingDataProvider:
         self.config = config
         self.use_pinned_memory = use_pinned_memory
         self.device = device
+        self.shuffle_buffer_bytes = shuffle_buffer_bytes
 
         if batch_size:
             self.stream = self.create_stream(
@@ -142,6 +144,7 @@ class TrainingDataProvider:
                 cyclic,
                 config,
                 ddp_config,
+                shuffle_buffer_bytes=shuffle_buffer_bytes,
             )
         else:
             self.stream = self.create_stream(
@@ -182,6 +185,7 @@ class SparseBatchProvider(TrainingDataProvider):
         ddp_config: DataloaderDDPConfig = None,
         use_pinned_memory=False,
         device="cpu",
+        shuffle_buffer_bytes: int = 0,
     ):
         super().__init__(
             feature_set,
@@ -197,6 +201,7 @@ class SparseBatchProvider(TrainingDataProvider):
             ddp_config,
             use_pinned_memory,
             device,
+            shuffle_buffer_bytes=shuffle_buffer_bytes,
         )
 
 
@@ -211,6 +216,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         config: DataloaderSkipConfig = DataloaderSkipConfig(),
         ddp_config: DataloaderDDPConfig = None,
         use_pinned_memory=False,
+        shuffle_buffer_bytes: int = 0,
     ):
         super().__init__()
         self.feature_set = feature_set
@@ -221,6 +227,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
         self.config = config
         self.ddp_config = ddp_config
         self.use_pinned_memory = use_pinned_memory
+        self.shuffle_buffer_bytes = shuffle_buffer_bytes
         self.device = "cpu"
 
     def __iter__(self):
@@ -234,6 +241,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
             ddp_config=self.ddp_config,
             use_pinned_memory=self.use_pinned_memory,
             device=self.device,
+            shuffle_buffer_bytes=self.shuffle_buffer_bytes,
         )
 
 
@@ -351,7 +359,12 @@ class FixedNumBatchesDataset(Dataset):
         self._start_prefetching()
 
         try:
-            item = self._prefetch_queue.get(timeout=300.0)  # 300 second timeout
+            # The montyformat shuffle buffer must fill one block (up to
+            # shuffle_buffer_gib/2 of host RAM) before the first batch is emitted.
+            # On a slow (e.g. ~125 MB/s networked) data drive that initial fill
+            # can take many minutes, so this timeout (which otherwise only guards
+            # against a genuinely stalled prefetch thread) is set generously.
+            item = self._prefetch_queue.get(timeout=1800.0)  # 30 min
 
             if item is None:
                 raise StopIteration("End of dataset reached")

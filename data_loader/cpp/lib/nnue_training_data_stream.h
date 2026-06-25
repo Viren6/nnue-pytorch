@@ -261,7 +261,7 @@ namespace training_data {
         return nullptr;
     }
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, int rank = 0, int world_size = 1)
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::vector<std::string>& filenames, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, int rank = 0, int world_size = 1, std::size_t shuffle_buffer_bytes = 0)
     {
         // TODO (low priority): optimize and parallelize .bin reading.
         if (has_extension(filenames[0], BinSfenInputStream::extension))
@@ -273,7 +273,8 @@ namespace training_data {
             else
                 // montyformat reader handles a single file; the recipe trains on one interleaved binpack.
                 // `concurrency` = reader threads the framework allocated -> decode in parallel.
-                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size, concurrency);
+                // shuffle_buffer_bytes>0 enables the in-loader block shuffle (training).
+                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size, concurrency, shuffle_buffer_bytes);
         }
 
         return nullptr;

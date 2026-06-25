@@ -38,12 +38,14 @@ NNUE_API FenBatchStream* NNUE_CDECL create_fen_batch_stream(int                 
                                                      int                  batch_size,
                                                      bool                 cyclic,
                                                      DataloaderSkipConfig config,
-                                                     DataloaderDDPConfig  ddp_config) {
+                                                     DataloaderDDPConfig  ddp_config,
+                                                     long long            shuffle_buffer_bytes) {
     auto skipPredicate = make_skip_predicate(config);
     auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
 
     return new FenBatchStream(concurrency, filenames_vec, batch_size, cyclic, skipPredicate,
-                              ddp_config.rank, ddp_config.world_size);
+                              ddp_config.rank, ddp_config.world_size,
+                              shuffle_buffer_bytes > 0 ? static_cast<std::size_t>(shuffle_buffer_bytes) : 0);
 }
 
 NNUE_API NNUE_COLD void NNUE_CDECL destroy_fen_batch_stream(FenBatchStream* stream) {
@@ -57,7 +59,8 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char* fe
                                                              int                  batch_size,
                                                              bool                 cyclic,
                                                              DataloaderSkipConfig config,
-                                                             DataloaderDDPConfig  ddp_config) {
+                                                             DataloaderDDPConfig  ddp_config,
+                                                             long long            shuffle_buffer_bytes) {
     auto skipPredicate = make_skip_predicate(config);
     auto filenames_vec = std::vector<std::string>(filenames, filenames + num_files);
 
@@ -65,7 +68,8 @@ NNUE_API SparseBatchStream* NNUE_CDECL create_sparse_batch_stream(const char* fe
     if (!feature)
         return nullptr;
     auto stream = new FeaturedBatchStream(std::move(feature), concurrency, filenames_vec, batch_size,
-                                   cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size);
+                                   cyclic, skipPredicate, ddp_config.rank, ddp_config.world_size,
+                                   shuffle_buffer_bytes > 0 ? static_cast<std::size_t>(shuffle_buffer_bytes) : 0);
     return reinterpret_cast<SparseBatchStream*>(stream);
 }
 

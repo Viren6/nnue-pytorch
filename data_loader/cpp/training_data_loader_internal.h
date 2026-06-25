@@ -74,9 +74,10 @@ struct Stream: AnyStream {
            bool cyclic,
            std::function<bool(const struct binpack::TrainingDataEntry&)> skipPredicate,
            int rank = 0,
-           int world_size = 1) :
+           int world_size = 1,
+           std::size_t shuffle_buffer_bytes = 0) :
         m_stream(training_data::open_sfen_input_file_parallel(
-          concurrency, filenames, cyclic, skipPredicate, rank, world_size)) {}
+          concurrency, filenames, cyclic, skipPredicate, rank, world_size, shuffle_buffer_bytes)) {}
 
     virtual StorageT* next() = 0;
 
@@ -95,7 +96,8 @@ struct FeaturedBatchStream final : Stream<SparseBatch> {
                         bool cyclic,
                         std::function<bool(const struct binpack::TrainingDataEntry&)> skipPredicate,
                         int rank = 0,
-                        int world_size = 1);
+                        int world_size = 1,
+                        std::size_t shuffle_buffer_bytes = 0);
     ~FeaturedBatchStream() final;
 
     SparseBatch* next() override;
@@ -146,7 +148,8 @@ struct FenBatchStream final : Stream<FenBatch> {
                    bool cyclic,
                    std::function<bool(const struct binpack::TrainingDataEntry&)> skipPredicate,
                    int rank = 0,
-                   int world_size = 1);
+                   int world_size = 1,
+                   std::size_t shuffle_buffer_bytes = 0);
     ~FenBatchStream() final;
 
     FenBatch* next() override;

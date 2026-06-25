@@ -15,6 +15,18 @@
 #include "training_data_loader_abi.h"
 #include "training_data_loader_internal.h"
 
+#include <cstdlib>
+
+// Lets the bench exercise the montyformat in-loader shuffle buffer:
+//   NNUE_SHUFFLE_BUFFER_GIB=<gib>   (0 / unset = disabled)
+static long long shuffle_bytes_from_env() {
+    const char* s = std::getenv("NNUE_SHUFFLE_BUFFER_GIB");
+    if (!s || !*s) return 0;
+    double gib = std::atof(s);
+    if (gib <= 0.0) return 0;
+    return static_cast<long long>(gib * 1024.0 * 1024.0 * 1024.0);
+}
+
 namespace fs = std::filesystem;
 
 // -----------------------------------------------------------------------------
@@ -241,7 +253,7 @@ void run_report(int concurrency, size_t iteration_count, size_t max_plies, int f
 
     std::unique_ptr<SparseBatchStream, SparseBatchStreamDeleter> stream(
         create_sparse_batch_stream("Full_Threats+HalfKAv2_hm", concurrency, file_count, files,
-            batch_size, cyclic, skip_config, ddp_config));
+            batch_size, cyclic, skip_config, ddp_config, shuffle_bytes_from_env()));
 
     DistributionReport report(max_plies);
 
@@ -340,7 +352,7 @@ void run_bench(int concurrency, size_t iteration_count, int do_cache_files, int 
 
     std::unique_ptr<SparseBatchStream, SparseBatchStreamDeleter> stream(
         create_sparse_batch_stream("Full_Threats+HalfKAv2_hm", concurrency, file_count, files,
-            batch_size, cyclic, skip_config, ddp_config));
+            batch_size, cyclic, skip_config, ddp_config, shuffle_bytes_from_env()));
 
     size_t warmup_iterations = 5;
     for (size_t i = 1; i <= warmup_iterations; ++i) {
