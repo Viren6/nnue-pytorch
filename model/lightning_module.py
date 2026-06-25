@@ -1,5 +1,8 @@
 import lightning as L
 import torch
+import numpy as np
+
+from collections import deque
 
 from torch import Tensor, nn
 from torchmetrics import MeanMetric, MetricCollection
@@ -71,6 +74,15 @@ class NNUE(L.LightningModule):
 
         # lazy init so `resume_from_model` with config changes works correctly
         self.optimizer_wrapper = None
+
+        # Adaptive gradient-norm clipping state (see configure_gradient_clipping).
+        # Clips the ~(100 - grad_clip_percentile)% largest-norm steps; a safety net
+        # against a single bad batch exploding the weights to NaN.
+        self._gc_pct = float(config.grad_clip_percentile)
+        self._gc_warmup = int(config.grad_clip_warmup)
+        self._gc_hist = deque(maxlen=int(config.grad_clip_history)) if self._gc_pct > 0 else None
+        self._gc_steps = 0
+        self._gc_clipped = 0
 
         # Initialize the lambda controller
         self.lambda_scheduler = LambdaController()
@@ -150,6 +162,59 @@ class NNUE(L.LightningModule):
         ]
 
         return self.optimizer_wrapper.configure_optimizers(train_params)
+
+    # --- adaptive gradient-norm clipping (replaces Lightning's fixed clip) ---
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        # Disabled -> behave exactly like no clipping.
+        if self._gc_pct <= 0:
+            return
+
+        params = [p for p in self.parameters() if p.grad is not None]
+        if not params:
+            return
+
+        # Total L2 grad norm over all parameters (single-GPU; not DDP-reduced).
+        total_norm = torch.norm(
+            torch.stack([p.grad.detach().norm(2) for p in params]), 2
+        )
+        self._gc_steps += 1
+
+        if not bool(torch.isfinite(total_norm)):
+            # inf/NaN gradient -> drop this step's update entirely.
+            for p in params:
+                p.grad.detach().zero_()
+            self._gc_clipped += 1
+        else:
+            tn = float(total_norm)
+            thr = None
+            if len(self._gc_hist) >= self._gc_warmup:
+                thr = float(
+                    np.percentile(
+                        np.fromiter(self._gc_hist, dtype=np.float64, count=len(self._gc_hist)),
+                        self._gc_pct,
+                    )
+                )
+            self._gc_hist.append(tn)  # record AFTER computing the threshold
+            if thr is not None and thr > 0.0 and tn > thr:
+                scale = thr / (tn + 1e-6)
+                for p in params:
+                    p.grad.detach().mul_(scale)
+                self._gc_clipped += 1
+
+        if self._gc_steps % 500 == 0:
+            try:
+                is_zero = self.trainer.is_global_zero
+            except Exception:
+                is_zero = True
+            if is_zero:
+                rate = 100.0 * self._gc_clipped / max(1, self._gc_steps)
+                print(
+                    f"[grad-clip] step {self._gc_steps}: clipped {self._gc_clipped} "
+                    f"({rate:.2f}%), last_norm={float(total_norm):.4g}",
+                    flush=True,
+                )
 
     # --- train / eval switch ---
     def train(self, mode: bool = True):

@@ -460,6 +460,11 @@ def main():
             swa_callback
         )
 
+    # Enabling Lightning's clipping path makes it call our adaptive
+    # configure_gradient_clipping hook (which ignores this value and clips at a
+    # running percentile of recent grad norms). None = clipping fully off.
+    grad_clip_enabled = args.nnue_lightning_config.grad_clip_percentile > 0
+
     trainer = L.Trainer(
         default_root_dir=logdir,
         max_epochs=args.max_epochs,
@@ -474,6 +479,8 @@ def main():
         benchmark=True,
         num_sanity_val_steps=0 if val is None else 2,
         check_val_every_n_epoch=args.check_val_every_n_epoch,
+        gradient_clip_val=1e9 if grad_clip_enabled else None,
+        gradient_clip_algorithm="norm",
     )
 
     if actual_threads > 0:

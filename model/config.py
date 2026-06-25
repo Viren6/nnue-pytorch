@@ -97,3 +97,15 @@ class NNUELightningConfig(FeatureConfig):
     optimizer_config: OmitArgPrefixes[OptimizerConfig] = field(
         default_factory=OptimizerConfig
     )
+
+    grad_clip_percentile: float = 0.0
+    """Adaptive gradient-norm clipping. Clip each step's total grad norm at this
+    running percentile of recent norms, e.g. 99.0 clips the ~1% largest-norm
+    steps. Self-calibrates as the gradient scale drifts over training. 0 disables
+    it. Non-finite (inf/NaN) grad norms are always zeroed (the step is skipped),
+    independent of this setting."""
+    grad_clip_history: int = 2000
+    """Window of recent finite grad norms used to estimate the clip percentile."""
+    grad_clip_warmup: int = 200
+    """Steps to collect grad norms before percentile clipping engages (non-finite
+    norms are still caught during this warmup)."""
