@@ -243,9 +243,10 @@ namespace training_data {
 
 namespace training_data {
 
-    // A ".binpack" file is either a Stockfish binpack (starts with the "BINP"
-    // chunk magic) or a Monty montyformat file (no magic). Sniff to decide which
-    // reader to use, so the same extension transparently handles both.
+    // A ".binpack" file is one of three things, distinguished by content sniff:
+    //   - Stockfish binpack          (starts with the "BINP" chunk magic)
+    //   - Monty compact 16-bit-Gini  (starts with the "MGC1" magic)
+    //   - Monty montyformat policy   (no magic)
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
     {
         if (has_extension(filename, BinSfenInputStream::extension))
@@ -255,7 +256,11 @@ namespace training_data {
             if (monty::looks_like_sf_binpack(filename))
                 return std::make_unique<BinpackSfenInputStream>(filename, cyclic, std::move(skipPredicate));
             else
-                return std::make_unique<monty::MontyFenInputStream>(filename, cyclic, std::move(skipPredicate));
+            {
+                const bool compact = monty::looks_like_compact(filename);
+                return std::make_unique<monty::MontyFenInputStream>(filename, cyclic, std::move(skipPredicate),
+                                                                    0, 1, 1, 0, compact);
+            }
         }
 
         return nullptr;
@@ -271,10 +276,14 @@ namespace training_data {
             if (monty::looks_like_sf_binpack(filenames[0]))
                 return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicate), rank, world_size);
             else
-                // montyformat reader handles a single file; the recipe trains on one interleaved binpack.
+            {
+                // montyformat / compact reader handles a single file; the recipe trains on one interleaved binpack.
                 // `concurrency` = reader threads the framework allocated -> decode in parallel.
                 // shuffle_buffer_bytes>0 enables the in-loader block shuffle (training).
-                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size, concurrency, shuffle_buffer_bytes);
+                // compact = the smaller 16-bit-Gini format (auto-detected by magic).
+                const bool compact = monty::looks_like_compact(filenames[0]);
+                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size, concurrency, shuffle_buffer_bytes, compact);
+            }
         }
 
         return nullptr;

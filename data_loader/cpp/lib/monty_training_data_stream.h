@@ -336,6 +336,22 @@ namespace monty {
         return f.gcount() == 4 && m[0] == 'B' && m[1] == 'I' && m[2] == 'N' && m[3] == 'P';
     }
 
+    // The compact 16-bit-Gini format (see monty_to_compact.cpp) begins with this
+    // 4-byte magic. After it, games use the SAME 43-byte montyformat header, but
+    // each position is a fixed 6-byte record (best_move u16, score u16, gini u16 =
+    // round(gini*65535)); the per-move policy visit distribution is dropped.
+    inline constexpr char       COMPACT_MAGIC[4]  = {'M', 'G', 'C', '1'};
+    inline constexpr std::size_t COMPACT_MAGIC_LEN = 4;
+
+    inline bool looks_like_compact(const std::string& filename)
+    {
+        std::ifstream f(filename, std::ios::in | std::ios::binary);
+        char m[4] = {0, 0, 0, 0};
+        f.read(m, 4);
+        return f.gcount() == 4 && m[0] == COMPACT_MAGIC[0] && m[1] == COMPACT_MAGIC[1]
+                               && m[2] == COMPACT_MAGIC[2] && m[3] == COMPACT_MAGIC[3];
+    }
+
     struct MontyFenInputStream : BasicSfenInputStream
     {
         static constexpr auto openmode = std::ios::in | std::ios::binary;
@@ -353,11 +369,12 @@ namespace monty {
         MontyFenInputStream(std::string filename, bool cyclic,
                             std::function<bool(const TrainingDataEntry&)> skipPredicate,
                             int rank = 0, int world_size = 1, int concurrency = 1,
-                            std::size_t shuffle_buffer_bytes = 0) :
+                            std::size_t shuffle_buffer_bytes = 0, bool compact = false) :
             m_filename(std::move(filename)),
             m_stream(m_filename, openmode),
             m_skipPredicate(std::move(skipPredicate)),
             m_cyclic(cyclic),
+            m_compact(compact),
             m_rank(rank),
             m_world_size(world_size < 1 ? 1 : world_size),
             m_shuffle_enabled(shuffle_buffer_bytes > 0),
@@ -373,6 +390,7 @@ namespace monty {
                 m_output_done.store(true);
                 return;
             }
+            seek_to_first_game(); // skip the compact-format magic, if any
 
             if (m_shuffle_enabled)
             {
@@ -473,14 +491,25 @@ namespace monty {
         // The slicer drains m_ready_idx; it is done once the shuffler exits.
         bool slicer_input_done()   const { return m_stop.load() || m_shuffler_done.load(); }
 
+        // Position the stream at the first game (past the compact-format magic).
+        void seek_to_first_game()
+        {
+            if (m_compact)
+                m_stream.seekg(static_cast<std::streamoff>(COMPACT_MAGIC_LEN), std::ios::beg);
+        }
+
         void reopen_locked()
         {
             m_stream = std::ifstream(m_filename, openmode);
             m_game_counter = 0;
+            seek_to_first_game();
         }
 
-        // Read one game's raw bytes (43-byte header + per-move 5B + visit bytes,
-        // ending at the 2-byte NULL terminator) into blob. false on short read.
+        // Read one game's raw bytes into blob. Montyformat: 43-byte header + per-move
+        // (best_move u16, score u16, num_moves u8, num_moves visit bytes), ending at the
+        // 2-byte NULL terminator. Compact: 43-byte header + fixed 6-byte records
+        // (best_move u16, score u16, gini u16), ending at the 2-byte NULL terminator.
+        // false on short read.
         bool read_raw_into(std::vector<std::uint8_t>& blob)
         {
             blob.clear();
@@ -488,6 +517,24 @@ namespace monty {
             m_stream.read(reinterpret_cast<char*>(hdr), 43);
             if (m_stream.gcount() != 43) return false;
             blob.insert(blob.end(), hdr, hdr + 43);
+
+            if (m_compact)
+            {
+                for (;;)
+                {
+                    std::uint8_t mv[2];
+                    m_stream.read(reinterpret_cast<char*>(mv), 2);
+                    if (m_stream.gcount() != 2) return false;
+                    blob.push_back(mv[0]); blob.push_back(mv[1]);
+                    if (mv[0] == 0 && mv[1] == 0) break; // 2-byte terminator
+                    std::uint8_t rest[4]; // score u16 + gini u16
+                    m_stream.read(reinterpret_cast<char*>(rest), 4);
+                    if (m_stream.gcount() != 4) return false;
+                    blob.insert(blob.end(), rest, rest + 4);
+                }
+                return true;
+            }
+
             for (;;)
             {
                 std::uint8_t mv[2];
@@ -518,6 +565,21 @@ namespace monty {
             std::uint8_t hdr[43];
             m_stream.read(reinterpret_cast<char*>(hdr), 43);
             if (m_stream.gcount() != 43) return false;
+
+            if (m_compact)
+            {
+                for (;;)
+                {
+                    std::uint8_t mv[2];
+                    m_stream.read(reinterpret_cast<char*>(mv), 2);
+                    if (m_stream.gcount() != 2) return false;
+                    if (mv[0] == 0 && mv[1] == 0) break;
+                    m_stream.seekg(4, std::ios::cur); // score u16 + gini u16
+                    if (!m_stream) return false;
+                }
+                return true;
+            }
+
             for (;;)
             {
                 std::uint8_t mv[2];
@@ -600,15 +662,24 @@ namespace monty {
                 if (best_move == 0) break; // NULL terminator
 
                 std::uint16_t score_raw;
-                std::uint8_t num_moves;
-                if (!rd(score_raw) || !rd(num_moves)) break;
-
                 double gini = 0.0;
-                if (num_moves > 0)
+                if (m_compact)
                 {
-                    if (p + num_moves > end) break;
-                    gini = policy_gini(p, num_moves);
-                    p += num_moves;
+                    // Compact format stores the Gini directly (u16 = round(gini*65535)).
+                    std::uint16_t gini_q;
+                    if (!rd(score_raw) || !rd(gini_q)) break;
+                    gini = static_cast<double>(gini_q) / 65535.0;
+                }
+                else
+                {
+                    std::uint8_t num_moves;
+                    if (!rd(score_raw) || !rd(num_moves)) break;
+                    if (num_moves > 0)
+                    {
+                        if (p + num_moves > end) break;
+                        gini = policy_gini(p, num_moves);
+                        p += num_moves;
+                    }
                 }
 
                 const bool is_capture = (best_move & 4) != 0;
@@ -793,6 +864,7 @@ namespace monty {
         std::ifstream m_stream;
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
         bool m_cyclic;
+        bool m_compact;   // compact 16-bit-Gini format (fixed 6-byte records, leading magic)
         int  m_rank;
         int  m_world_size;
 
