@@ -270,6 +270,33 @@ namespace monty {
         return static_cast<std::int16_t>(cp);
     }
 
+    // Gini impurity of the MCTS policy (visit distribution): 1 - sum(p_i^2)
+    // over the visit shares. Low (near 0) => "sharp"/decisive policy; high
+    // (near 1-1/n) => flat/uncertain. visits are the max-scaled u8 counts as
+    // stored in the file (linear scaling preserves the shares).
+    inline double policy_gini(const std::uint8_t* visits, int n)
+    {
+        long sum = 0;
+        for (int i = 0; i < n; ++i) sum += visits[i];
+        if (sum <= 0) return 0.0;
+        const double inv = 1.0 / static_cast<double>(sum);
+        double s2 = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double p = static_cast<double>(visits[i]) * inv;
+            s2 += p * p;
+        }
+        return 1.0 - s2;
+    }
+
+    // Positions whose policy is "sharp" (Gini impurity below this threshold) are
+    // dropped. 0.9 is ~the median Gini of interleaved-new-policy.binpack, so the
+    // Gini test alone filters ~50% of positions (the low-impurity half). Set to
+    // 0 to disable the Gini test. In addition (see read_game) every capture and
+    // every in-check position is dropped regardless of Gini, which removes a
+    // further ~5% (the high-Gini captures the Gini test would keep).
+    inline constexpr double MONTY_GINI_MIN = 0.9;
+
     // best-effort Monty move -> chess::Move (only consumed by optional filters).
     inline chess::Move monty_move_to_sf(std::uint16_t mov, bool stm)
     {
@@ -449,18 +476,44 @@ namespace monty {
 
                 std::uint8_t num_moves;
                 if (!read_le(num_moves)) return false;
-                if (num_moves > 0) m_stream.seekg(num_moves, std::ios::cur); // drop policy
 
-                const int stmv = pos.stm ? 1 : 0;
+                // Read the policy visit distribution and compute its Gini
+                // impurity (a position with no/degenerate distribution counts as
+                // maximally sharp, gini=0). The distribution is then discarded.
+                double gini = 0.0;
+                if (num_moves > 0)
+                {
+                    std::uint8_t visits[256];
+                    m_stream.read(reinterpret_cast<char*>(visits), num_moves);
+                    if (m_stream.gcount() != num_moves) return false;
+                    gini = policy_gini(visits, num_moves);
+                }
 
-                TrainingDataEntry e;
-                e.pos    = chess::Position::fromFen(pos.sf_fen().c_str());
-                e.move   = monty_move_to_sf(best_move, pos.stm);
-                e.score  = score_to_cp(static_cast<float>(score_raw) /
-                                       static_cast<float>(0xFFFF));
-                e.ply    = static_cast<std::uint16_t>(2 * (static_cast<int>(pos.fullm) - 1) + stmv);
-                e.result = static_cast<std::int16_t>(stmv ? -white_result : white_result);
-                m_buf.emplace_back(e);
+                // Filter, cheapest test first:
+                //  1. sharp policy (low Gini impurity), gini >= 0 always so
+                //     MONTY_GINI_MIN == 0 keeps everything;
+                //  2. the best move is a capture (CAP bit set: capture, en
+                //     passant, or promo-capture);
+                //  3. the side to move is in check.
+                // (2) and (3) are guaranteed dropped regardless of Gini.
+                const bool is_capture = (best_move & 4) != 0;
+                if (!(gini < MONTY_GINI_MIN) && !is_capture)
+                {
+                    const int stmv = pos.stm ? 1 : 0;
+
+                    chess::Position sfp = chess::Position::fromFen(pos.sf_fen().c_str());
+                    if (!sfp.isCheck())
+                    {
+                        TrainingDataEntry e;
+                        e.pos    = sfp;
+                        e.move   = monty_move_to_sf(best_move, pos.stm);
+                        e.score  = score_to_cp(static_cast<float>(score_raw) /
+                                               static_cast<float>(0xFFFF));
+                        e.ply    = static_cast<std::uint16_t>(2 * (static_cast<int>(pos.fullm) - 1) + stmv);
+                        e.result = static_cast<std::int16_t>(stmv ? -white_result : white_result);
+                        m_buf.emplace_back(e);
+                    }
+                }
 
                 pos.make(best_move, cast);
             }
