@@ -272,7 +272,8 @@ namespace training_data {
                 return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicate), rank, world_size);
             else
                 // montyformat reader handles a single file; the recipe trains on one interleaved binpack.
-                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size);
+                // `concurrency` = reader threads the framework allocated -> decode in parallel.
+                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size, concurrency);
         }
 
         return nullptr;

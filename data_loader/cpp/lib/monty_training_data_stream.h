@@ -7,7 +7,8 @@
 // Monty stores, per game, a start position + a list of (best_move, win-prob
 // score, visit distribution).  The Stockfish NNUE trainer is a *value* trainer,
 // so this reader extracts, for every position, exactly what binpack::
-// TrainingDataEntry needs and DROPS the policy visit distribution:
+// TrainingDataEntry needs and DROPS the policy visit distribution (after using
+// it for the Gini filter):
 //
 //   pos    : reconstructed by replaying best moves from the start position
 //   score  : win-prob (side-to-move relative, [0,1]) -> stm centipawns
@@ -15,24 +16,36 @@
 //   ply    : 2*(fullm-1) + stm
 //   move   : best_move (best-effort; only used by optional "filtered" skipping)
 //
+// Filtering (see read/decode): a position is dropped if its policy is "sharp"
+// (Gini impurity < MONTY_GINI_MIN), the best move is a capture, or the side to
+// move is in check; the trainer's skipPredicate is then applied on top.
+//
+// THREADING: decoding (replay + fromFen + isCheck) is CPU-heavy, so it is done
+// in parallel across `concurrency` producer threads. Each producer grabs raw
+// game bytes under a short lock (cheap I/O) and decodes them lock-free, pushing
+// decoded chunks into a bounded queue that fill()/next() drain. This keeps the
+// GPU fed; a single-threaded decoder cannot. With concurrency==1 the output is
+// in deterministic file order (used by tools and the verifier).
+//
 // Conventions are taken verbatim from monty/crates/montyformat
 // (format.rs, value.rs, chess/{position,moves,frc,consts}.rs) and verified
-// position-by-position against Monty's own decoder.  The on-disk format is
-// little-endian and uncompressed; this reader assumes a little-endian host
-// (x86-64 / aarch64), like the rest of the trainer.
+// position-by-position against Monty's own decoder. The on-disk format is
+// little-endian and uncompressed; this reader assumes a little-endian host.
 
-#include "training_data_entry.h" // binpack::TrainingDataEntry + chess::Position (post-#489 split of nnue_training_data_formats.h)
+#include "training_data_entry.h" // binpack::TrainingDataEntry + chess::Position
+#include "thread_safe_types.h"   // ThreadSafeRingBuffer
 
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace training_data {
@@ -193,10 +206,9 @@ namespace monty {
             return fen;
         }
 
-        // FEN fed to chess::Position::fromFen for actual training.  Castling and
+        // FEN fed to chess::Position::fromFen for actual training. Castling and
         // en-passant are emitted as '-': neither affects NNUE value features, and
-        // dropping castling makes the FEN safe for FRC/DFRC positions (no need to
-        // match rook letters to squares).
+        // dropping castling makes the FEN safe for FRC/DFRC positions.
         std::string sf_fen() const
         {
             std::string fen;
@@ -255,11 +267,9 @@ namespace monty {
 
     // win-prob (stm-relative, [0,1]) -> stm-relative centipawns.
     // Same logistic Monty uses in value.rs, with no white-flip (policy score is
-    // already stm-relative).  Clamped away from 0/1 and into int16 range.
+    // already stm-relative). Clamped (in float, matching Monty) into int16 range.
     inline std::int16_t score_to_cp(float p)
     {
-        // Clamp in float (matches Monty's f32 math) before widening, so the
-        // saturation boundary is identical to the reference decoder.
         if (p < 1e-6f) p = 1e-6f;
         if (p > 1.0f - 1e-6f) p = 1.0f - 1e-6f;
         double pp = static_cast<double>(p);
@@ -270,10 +280,7 @@ namespace monty {
         return static_cast<std::int16_t>(cp);
     }
 
-    // Gini impurity of the MCTS policy (visit distribution): 1 - sum(p_i^2)
-    // over the visit shares. Low (near 0) => "sharp"/decisive policy; high
-    // (near 1-1/n) => flat/uncertain. visits are the max-scaled u8 counts as
-    // stored in the file (linear scaling preserves the shares).
+    // Gini impurity of the MCTS policy (visit distribution): 1 - sum(p_i^2).
     inline double policy_gini(const std::uint8_t* visits, int n)
     {
         long sum = 0;
@@ -289,12 +296,8 @@ namespace monty {
         return 1.0 - s2;
     }
 
-    // Positions whose policy is "sharp" (Gini impurity below this threshold) are
-    // dropped. 0.9 is ~the median Gini of interleaved-new-policy.binpack, so the
-    // Gini test alone filters ~50% of positions (the low-impurity half). Set to
-    // 0 to disable the Gini test. In addition (see read_game) every capture and
-    // every in-check position is dropped regardless of Gini, which removes a
-    // further ~5% (the high-Gini captures the Gini test would keep).
+    // Sharp-policy threshold (~median Gini); see read/decode. Plus every capture
+    // and in-check position is dropped regardless of Gini. 0 disables the Gini test.
     inline constexpr double MONTY_GINI_MIN = 0.9;
 
     // best-effort Monty move -> chess::Move (only consumed by optional filters).
@@ -333,37 +336,71 @@ namespace monty {
     struct MontyFenInputStream : BasicSfenInputStream
     {
         static constexpr auto openmode = std::ios::in | std::ios::binary;
+        static constexpr std::size_t QUEUE_CAPACITY = 512;       // chunks buffered
+        static constexpr std::size_t CHUNK_SIZE     = 256;       // entries per chunk
+        static constexpr int         READ_GAMES_PER_LOCK = 16;   // amortize read lock
+        using Chunk = std::vector<TrainingDataEntry>;
 
         MontyFenInputStream(std::string filename, bool cyclic,
                             std::function<bool(const TrainingDataEntry&)> skipPredicate,
-                            int rank = 0, int world_size = 1) :
-            m_stream(filename, openmode),
+                            int rank = 0, int world_size = 1, int concurrency = 1) :
             m_filename(std::move(filename)),
-            m_eof(!m_stream),
-            m_cyclic(cyclic),
+            m_stream(m_filename, openmode),
             m_skipPredicate(std::move(skipPredicate)),
+            m_cyclic(cyclic),
             m_rank(rank),
             m_world_size(world_size < 1 ? 1 : world_size)
         {
+            m_queue.reserve_internal(CHUNK_SIZE);
+            const int nprod = concurrency < 1 ? 1 : concurrency;
+            if (!m_stream)
+            {
+                m_active_producers.store(0);
+                m_eof.store(true);
+                return;
+            }
+            m_active_producers.store(nprod);
+            m_producers.reserve(nprod);
+            for (int i = 0; i < nprod; ++i)
+                m_producers.emplace_back([this]() { producer_loop(); });
         }
 
         std::optional<TrainingDataEntry> next() override
         {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            return next_impl();
+            std::lock_guard<std::mutex> lk(m_next_mutex);
+            for (;;)
+            {
+                if (m_next_idx < m_next_buf.size())
+                    return m_next_buf[m_next_idx++];
+                m_next_buf.clear();
+                m_next_idx = 0;
+                m_next_buf.reserve(CHUNK_SIZE);
+                if (!m_queue.take(m_next_buf, [this]() { return queue_done(); }))
+                {
+                    m_eof.store(true);
+                    return std::nullopt;
+                }
+            }
         }
 
         void fill(std::vector<TrainingDataEntry>& vec, std::size_t n) override
         {
-            std::lock_guard<std::mutex> lk(m_mutex);
-            for (std::size_t i = 0; i < n; ++i)
+            while (vec.size() < n)
             {
-                auto v = next_impl();
-                if (!v.has_value()) break;
-                vec.emplace_back(*v);
+                Chunk chunk;
+                chunk.reserve(CHUNK_SIZE);
+                if (!m_queue.take(chunk, [this]() { return queue_done(); }))
+                {
+                    m_eof.store(true);
+                    break;
+                }
+                for (auto& e : chunk)
+                    vec.push_back(std::move(e));
             }
         }
 
+        // Queue is already thread-safe; do NOT take the base fill_lock (it would
+        // serialize all consumers and defeat the point).
         void fill_threadsafe(std::vector<TrainingDataEntry>& vec, std::size_t n) override
         {
             fill(vec, n);
@@ -371,139 +408,167 @@ namespace monty {
 
         bool eof() const override { return m_eof.load(); }
 
-        ~MontyFenInputStream() override {}
+        ~MontyFenInputStream() override
+        {
+            m_stop.store(true);
+            m_queue.signal_stop(true); // wake producers (put) and consumers (take)
+            for (auto& t : m_producers)
+                if (t.joinable())
+                    t.join();
+        }
 
     private:
-        template <class T> bool read_le(T& v)
+        // consumers should stop waiting once shutting down or all producers exited
+        bool queue_done() const
         {
-            m_stream.read(reinterpret_cast<char*>(&v), sizeof(T));
-            return m_stream.gcount() == static_cast<std::streamsize>(sizeof(T));
+            return m_stop.load() || m_active_producers.load() == 0;
         }
 
-        std::optional<TrainingDataEntry> next_impl()
+        void reopen_locked()
         {
-            for (;;)
-            {
-                while (m_buf_idx < m_buf.size())
-                {
-                    const TrainingDataEntry& e = m_buf[m_buf_idx++];
-                    if (!m_skipPredicate || !m_skipPredicate(e))
-                        return e;
-                }
-
-                m_buf.clear();
-                m_buf_idx = 0;
-
-                if (!load_next_assigned_game())
-                {
-                    if (m_cyclic && !m_reopened_once)
-                    {
-                        m_stream = std::ifstream(m_filename, openmode);
-                        m_reopened_once = true;
-                        m_game_counter = 0;
-                        if (!m_stream) { m_eof.store(true); return std::nullopt; }
-                        continue;
-                    }
-                    m_eof.store(true);
-                    return std::nullopt;
-                }
-            }
+            m_stream = std::ifstream(m_filename, openmode);
+            m_game_counter = 0;
         }
 
-        // Skip exactly one game's bytes, consuming the same span as read_game:
-        // a 43-byte header, then per move a 2-byte move + 2-byte score + 1-byte
-        // count + count visit bytes, ending at the 2-byte NULL terminator.
-        // NB: the terminator is a 2-byte u16 (matches montyformat deserialise_from);
-        // it must NOT be read as a 5-byte move header, or framing drifts.
-        bool skip_game()
+        // Read one game's raw bytes (43-byte header + per-move 5B + visit bytes,
+        // ending at the 2-byte NULL terminator) into blob. false on short read.
+        bool read_raw_into(std::vector<std::uint8_t>& blob)
         {
-            char header[43];
-            m_stream.read(header, 43);
+            blob.clear();
+            std::uint8_t hdr[43];
+            m_stream.read(reinterpret_cast<char*>(hdr), 43);
             if (m_stream.gcount() != 43) return false;
+            blob.insert(blob.end(), hdr, hdr + 43);
             for (;;)
             {
-                std::uint16_t best_move;
-                if (!read_le(best_move)) return false;
-                if (best_move == 0) break;
-                std::uint16_t score_raw;
-                std::uint8_t num_moves;
-                if (!read_le(score_raw) || !read_le(num_moves)) return false;
-                if (num_moves > 0) m_stream.seekg(num_moves, std::ios::cur);
+                std::uint8_t mv[2];
+                m_stream.read(reinterpret_cast<char*>(mv), 2);
+                if (m_stream.gcount() != 2) return false;
+                blob.push_back(mv[0]);
+                blob.push_back(mv[1]);
+                if (mv[0] == 0 && mv[1] == 0) break; // 2-byte terminator
+                std::uint8_t rest[3];
+                m_stream.read(reinterpret_cast<char*>(rest), 3);
+                if (m_stream.gcount() != 3) return false;
+                blob.push_back(rest[0]); blob.push_back(rest[1]); blob.push_back(rest[2]);
+                const int nm = rest[2];
+                if (nm > 0)
+                {
+                    const std::size_t s = blob.size();
+                    blob.resize(s + nm);
+                    m_stream.read(reinterpret_cast<char*>(blob.data()) + s, nm);
+                    if (m_stream.gcount() != nm) return false;
+                }
             }
             return true;
         }
 
-        // Read & decode one game into m_buf (positions). Returns false at EOF.
-        bool read_game()
+        // Skip one game's raw bytes (sharding). false on short read.
+        bool skip_raw()
         {
-            std::uint64_t qbbs[4];
-            for (int i = 0; i < 4; ++i) if (!read_le(qbbs[i])) return false;
+            std::uint8_t hdr[43];
+            m_stream.read(reinterpret_cast<char*>(hdr), 43);
+            if (m_stream.gcount() != 43) return false;
+            for (;;)
+            {
+                std::uint8_t mv[2];
+                m_stream.read(reinterpret_cast<char*>(mv), 2);
+                if (m_stream.gcount() != 2) return false;
+                if (mv[0] == 0 && mv[1] == 0) break;
+                std::uint8_t rest[3];
+                m_stream.read(reinterpret_cast<char*>(rest), 3);
+                if (m_stream.gcount() != 3) return false;
+                const int nm = rest[2];
+                if (nm > 0) { m_stream.seekg(nm, std::ios::cur); if (!m_stream) return false; }
+            }
+            return true;
+        }
 
-            std::uint8_t  stm_u8, enp_u8, rights_u8, halfm_u8;
+        // Get the next game assigned to this rank into blob. Must hold m_read_mutex.
+        // Handles DDP sharding and cyclic reopen. false only at true (non-cyclic) EOF.
+        bool next_assigned_game_locked(std::vector<std::uint8_t>& blob)
+        {
+            for (;;)
+            {
+                if (m_stop.load()) return false;
+                if (m_stream.peek() == std::char_traits<char>::eof() || !m_stream)
+                {
+                    if (m_cyclic) { reopen_locked(); if (!m_stream) return false; continue; }
+                    return false;
+                }
+                const bool assigned = (m_game_counter % m_world_size) == m_rank;
+                ++m_game_counter;
+                if (assigned)
+                {
+                    if (read_raw_into(blob)) return true;
+                    if (m_cyclic) { reopen_locked(); continue; } // truncated tail
+                    return false;
+                }
+                if (!skip_raw())
+                {
+                    if (m_cyclic) { reopen_locked(); continue; }
+                    return false;
+                }
+            }
+        }
+
+        // Decode one game's raw bytes into out (filtered + skipPredicate'd). No lock.
+        void decode_blob(const std::vector<std::uint8_t>& blob, Chunk& out)
+        {
+            const std::uint8_t* p   = blob.data();
+            const std::uint8_t* end = p + blob.size();
+            auto rd = [&](auto& v) -> bool {
+                if (p + sizeof(v) > end) return false;
+                std::memcpy(&v, p, sizeof(v));
+                p += sizeof(v);
+                return true;
+            };
+
+            std::uint64_t qbbs[4];
+            for (int i = 0; i < 4; ++i) if (!rd(qbbs[i])) return;
+            std::uint8_t stm_u8, enp_u8, rights_u8, halfm_u8;
             std::uint16_t fullm_u16;
-            if (!read_le(stm_u8) || !read_le(enp_u8) || !read_le(rights_u8) ||
-                !read_le(halfm_u8) || !read_le(fullm_u16))
-                return false;
+            if (!rd(stm_u8) || !rd(enp_u8) || !rd(rights_u8) || !rd(halfm_u8) || !rd(fullm_u16)) return;
 
             MPosition pos;
             decode_quad_bbs(qbbs, pos.bb);
-            pos.stm    = stm_u8 > 0;
-            pos.enp_sq = enp_u8;
-            pos.rights = rights_u8;
-            pos.halfm  = halfm_u8;
-            pos.fullm  = fullm_u16;
+            pos.stm = stm_u8 > 0; pos.enp_sq = enp_u8; pos.rights = rights_u8;
+            pos.halfm = halfm_u8; pos.fullm = fullm_u16;
 
             std::uint8_t rf[2][2];
-            for (int s = 0; s < 2; ++s)
-                for (int k = 0; k < 2; ++k)
-                    if (!read_le(rf[s][k])) return false;
-
+            for (int s = 0; s < 2; ++s) for (int k = 0; k < 2; ++k) if (!rd(rf[s][k])) return;
             MCastling cast;
             castling_from_raw(pos, rf, cast);
 
             std::uint8_t result_u8;
-            if (!read_le(result_u8)) return false;
-            const int white_result = static_cast<int>(result_u8) - 1; // 0->-1,1->0,2->+1
+            if (!rd(result_u8)) return;
+            const int white_result = static_cast<int>(result_u8) - 1;
 
             for (;;)
             {
                 std::uint16_t best_move;
-                if (!read_le(best_move)) return false;
-                if (best_move == 0) break; // Move::NULL terminates the game
+                if (!rd(best_move)) break;
+                if (best_move == 0) break; // NULL terminator
 
                 std::uint16_t score_raw;
-                if (!read_le(score_raw)) return false;
-
                 std::uint8_t num_moves;
-                if (!read_le(num_moves)) return false;
+                if (!rd(score_raw) || !rd(num_moves)) break;
 
-                // Read the policy visit distribution and compute its Gini
-                // impurity (a position with no/degenerate distribution counts as
-                // maximally sharp, gini=0). The distribution is then discarded.
                 double gini = 0.0;
                 if (num_moves > 0)
                 {
-                    std::uint8_t visits[256];
-                    m_stream.read(reinterpret_cast<char*>(visits), num_moves);
-                    if (m_stream.gcount() != num_moves) return false;
-                    gini = policy_gini(visits, num_moves);
+                    if (p + num_moves > end) break;
+                    gini = policy_gini(p, num_moves);
+                    p += num_moves;
                 }
 
-                // Filter, cheapest test first:
-                //  1. sharp policy (low Gini impurity), gini >= 0 always so
-                //     MONTY_GINI_MIN == 0 keeps everything;
-                //  2. the best move is a capture (CAP bit set: capture, en
-                //     passant, or promo-capture);
-                //  3. the side to move is in check.
-                // (2) and (3) are guaranteed dropped regardless of Gini.
                 const bool is_capture = (best_move & 4) != 0;
                 if (!(gini < MONTY_GINI_MIN) && !is_capture)
                 {
-                    const int stmv = pos.stm ? 1 : 0;
-
                     chess::Position sfp = chess::Position::fromFen(pos.sf_fen().c_str());
                     if (!sfp.isCheck())
                     {
+                        const int stmv = pos.stm ? 1 : 0;
                         TrainingDataEntry e;
                         e.pos    = sfp;
                         e.move   = monty_move_to_sf(best_move, pos.stm);
@@ -511,47 +576,73 @@ namespace monty {
                                                static_cast<float>(0xFFFF));
                         e.ply    = static_cast<std::uint16_t>(2 * (static_cast<int>(pos.fullm) - 1) + stmv);
                         e.result = static_cast<std::int16_t>(stmv ? -white_result : white_result);
-                        m_buf.emplace_back(e);
+                        if (!m_skipPredicate || !m_skipPredicate(e))
+                            out.push_back(std::move(e));
                     }
                 }
 
                 pos.make(best_move, cast);
             }
-            return true;
         }
 
-        // Honour DDP sharding: only games with (index % world_size == rank) are
-        // decoded; the rest are skipped.
-        bool load_next_assigned_game()
+        void producer_loop()
         {
-            for (;;)
+            Chunk chunk;
+            chunk.reserve(CHUNK_SIZE);
+            std::vector<std::vector<std::uint8_t>> blobs;
+            blobs.reserve(READ_GAMES_PER_LOCK);
+            bool running = true;
+
+            while (running && !m_stop.load())
             {
-                m_stream.peek();
-                if (!m_stream || m_stream.eof()) return false;
-
-                const bool assigned = (m_game_counter % m_world_size) == m_rank;
-                ++m_game_counter;
-
-                if (assigned)
-                    return read_game();
-                if (!skip_game())
-                    return false;
+                blobs.clear();
+                bool eof = false;
+                {
+                    std::lock_guard<std::mutex> lk(m_read_mutex);
+                    for (int i = 0; i < READ_GAMES_PER_LOCK && !m_stop.load(); ++i)
+                    {
+                        std::vector<std::uint8_t> b;
+                        if (!next_assigned_game_locked(b)) { eof = true; break; }
+                        blobs.push_back(std::move(b));
+                    }
+                }
+                for (auto& b : blobs)
+                {
+                    decode_blob(b, chunk);
+                    if (chunk.size() >= CHUNK_SIZE)
+                    {
+                        if (!m_queue.put(chunk, [this]() { return m_stop.load(); })) { running = false; break; }
+                        chunk.clear();
+                    }
+                }
+                if (eof) running = false;
             }
+
+            if (!chunk.empty() && !m_stop.load())
+                m_queue.put(chunk, [this]() { return m_stop.load(); });
+            if (m_active_producers.fetch_sub(1) == 1)
+                m_queue.signal_stop(false); // last producer: wake consumers so they can finish
         }
 
-        std::ifstream m_stream;
         std::string   m_filename;
-        std::atomic<bool> m_eof;
-        bool m_cyclic;
+        std::ifstream m_stream;
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        bool m_cyclic;
         int  m_rank;
         int  m_world_size;
 
-        std::mutex m_mutex;
-        std::vector<TrainingDataEntry> m_buf;
-        std::size_t m_buf_idx = 0;
-        long long   m_game_counter = 0;
-        bool        m_reopened_once = false;
+        std::mutex m_read_mutex;
+        long long  m_game_counter = 0; // guarded by m_read_mutex
+
+        thread_safe_types::ThreadSafeRingBuffer<Chunk, QUEUE_CAPACITY> m_queue;
+        std::vector<std::thread> m_producers;
+        std::atomic<int>  m_active_producers{0};
+        std::atomic<bool> m_stop{false};
+        std::atomic<bool> m_eof{false};
+
+        std::mutex  m_next_mutex; // serializes next() (non-parallel path)
+        Chunk       m_next_buf;
+        std::size_t m_next_idx = 0;
     };
 
 } // namespace monty
