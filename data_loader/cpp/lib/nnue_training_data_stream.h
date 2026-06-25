@@ -236,12 +236,27 @@ namespace training_data {
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
     };
 
+} // namespace training_data
+
+// Defined after BasicSfenInputStream so MontyFenInputStream can derive from it.
+#include "monty_training_data_stream.h"
+
+namespace training_data {
+
+    // A ".binpack" file is either a Stockfish binpack (starts with the "BINP"
+    // chunk magic) or a Monty montyformat file (no magic). Sniff to decide which
+    // reader to use, so the same extension transparently handles both.
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
     {
         if (has_extension(filename, BinSfenInputStream::extension))
             return std::make_unique<BinSfenInputStream>(filename, cyclic, std::move(skipPredicate));
         else if (has_extension(filename, BinpackSfenInputStream::extension))
-            return std::make_unique<BinpackSfenInputStream>(filename, cyclic, std::move(skipPredicate));
+        {
+            if (monty::looks_like_sf_binpack(filename))
+                return std::make_unique<BinpackSfenInputStream>(filename, cyclic, std::move(skipPredicate));
+            else
+                return std::make_unique<monty::MontyFenInputStream>(filename, cyclic, std::move(skipPredicate));
+        }
 
         return nullptr;
     }
@@ -252,7 +267,13 @@ namespace training_data {
         if (has_extension(filenames[0], BinSfenInputStream::extension))
             return std::make_unique<BinSfenInputStream>(filenames[0], cyclic, std::move(skipPredicate));
         else if (has_extension(filenames[0], BinpackSfenInputParallelStream::extension))
-            return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicate), rank, world_size);
+        {
+            if (monty::looks_like_sf_binpack(filenames[0]))
+                return std::make_unique<BinpackSfenInputParallelStream>(concurrency, filenames, cyclic, std::move(skipPredicate), rank, world_size);
+            else
+                // montyformat reader handles a single file; the recipe trains on one interleaved binpack.
+                return std::make_unique<monty::MontyFenInputStream>(filenames[0], cyclic, std::move(skipPredicate), rank, world_size);
+        }
 
         return nullptr;
     }
